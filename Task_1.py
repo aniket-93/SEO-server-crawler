@@ -70,7 +70,7 @@ import subprocess
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import (
     parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -418,7 +418,7 @@ class MongoRepository:
             {"$set": {
                 "status": "RESERVED",
                 "worker_id": worker_id,
-                "lease_until": now + __import__("datetime").timedelta(seconds=60),
+                "lease_until": now + timedelta(seconds=60),
                 "updated_at": now
             }},
             return_document=ReturnDocument.AFTER
@@ -570,6 +570,18 @@ class HTMLStorage:
             base += ".html"
         return base[:180]
 
+    def load_existing(self, domain, url):
+        file_path = Config.HTML_ROOT / domain / self.filename_for(url)
+        if not file_path.exists():
+            return None
+        html = file_path.read_text(encoding="utf-8")
+        previous = self.repository.pages.find_one(
+            {"domain": domain, "url": url},
+            sort=[("crawled_at", -1)]
+        )
+        status_code = previous.get("http_status_code", 200) if previous else 200
+        return html, status_code
+
     def save(self, session_id, domain, url, html, status_code, metadata):
         domain_folder = Config.HTML_ROOT / domain
         domain_folder.mkdir(parents=True, exist_ok=True)
@@ -714,9 +726,15 @@ class DomainCrawler:
                     continue
 
                 try:
-                    response, final_url, html = await self.fetch(page, url)
+                    cached_page = self.storage.load_existing(domain, url)
+                    if cached_page:
+                        html, status_code = cached_page
+                        final_url = url
+                    else:
+                        response, final_url, html = await self.fetch(page, url)
+                        status_code = response.status
+
                     final_url = URLManager.normalize(final_url)
-                    status_code = response.status
 
                     if not final_url:
                         raise RuntimeError("Invalid final URL after redirect.")
@@ -1070,9 +1088,20 @@ class CrawlerApplication:
             {"session_id": session_id},
             {"$set": {"status": "RUNNING", "updated_at": MongoRepository.now()}}
         )
+        self.repository.urls.update_many(
+            {"session_id": session_id,
+             "status": {"$in": ["RESERVED", "PROCESSING"]}},
+            {"$set": {
+                "status": "READY",
+                "worker_id": None,
+                "lease_until": None,
+                "updated_at": MongoRepository.now()
+            }}
+        )
         self.repository.domains.update_many(
-            {"session_id": session_id, "status": {"$in": ["PAUSED", "STOPPED"]}},
-            {"$set": {"status": "RUNNING"}}
+            {"session_id": session_id,
+             "status": {"$in": ["PAUSED", "STOPPED", "RUNNING", "RESERVED"]}},
+            {"$set": {"status": "READY", "worker_id": None}}
         )
         await self.run_session(session_id)
 
