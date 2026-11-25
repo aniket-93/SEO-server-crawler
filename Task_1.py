@@ -1,6 +1,5 @@
 # Google Colab SEO Crawler
-# Run this file in a Colab cell with: %run /content/Task_1.py
-# Or paste into a cell and run: await main()
+# Paste this file into a Google Colab code cell and run it.
 
 # ---------------------------------------------------------------------
 # 1. INSTALLATION
@@ -681,6 +680,15 @@ class DomainCrawler:
                 success_count = domain_doc.get("successful_pages", 0)
 
                 if success_count >= Config.MAX_PAGES_PER_DOMAIN:
+                    self.repository.urls.update_many(
+                        {"session_id": session_id, "domain": domain,
+                         "status": "READY"},
+                        {"$set": {
+                            "status": "SKIPPED",
+                            "last_error": "Domain page limit reached.",
+                            "updated_at": MongoRepository.now()
+                        }}
+                    )
                     self.repository.log(
                         session_id, "DOMAIN_PAGE_LIMIT_REACHED",
                         domain=domain, status="SKIPPED",
@@ -714,6 +722,10 @@ class DomainCrawler:
                     lease_until=MongoRepository.now()
                 )
                 url = item["url"]
+                self.repository.domains.update_one(
+                    {"session_id": session_id, "domain": domain},
+                    {"$set": {"current_url": url}}
+                )
 
                 if not self.robots.allowed(url):
                     self.repository.set_url_status(item["_id"], "SKIPPED")
@@ -776,7 +788,12 @@ class DomainCrawler:
                         "COMPLETED", {"http_status_code": status_code}
                     )
 
-                    if success_count < Config.MAX_PAGES_PER_DOMAIN:
+                    print(
+                        f"[{domain}] {success_count}/"
+                        f"{Config.MAX_PAGES_PER_DOMAIN} pages: {final_url}"
+                    )
+
+                    if success_count < Config.MAX_PAGES_PER_DOMAIN and not control["stop"]:
                         for discovered_url in metadata["links"]:
                             if URLManager.belongs_to_domain(
                                 discovered_url, domain
@@ -823,6 +840,11 @@ class DomainCrawler:
                             session_id, "URL_FAILED", url, domain, "FAILED",
                             {"attempts": attempts, "error": str(exc)}
                         )
+                finally:
+                    self.repository.domains.update_one(
+                        {"session_id": session_id, "domain": domain},
+                        {"$unset": {"current_url": ""}}
+                    )
         finally:
             await page.close()
 
@@ -974,6 +996,7 @@ class ConsoleController:
                 f"discovered {domain.get('discovered_count', 0)} | "
                 f"pending {counts['READY'] + counts['RESERVED'] + counts['PROCESSING']} | "
                 f"failed {counts['FAILED']} | skipped {counts['SKIPPED']} | "
+                f"current {domain.get('current_url') or '-'} | "
                 f"status {domain.get('status')}"
             )
 
