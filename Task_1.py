@@ -261,7 +261,7 @@ class MongoRepository:
             ("priority_rank", ASCENDING), ("created_at", ASCENDING)
         ])
         self.pages.create_index(
-            [("session_id", ASCENDING), ("url", ASCENDING)], unique=True
+            [("session_id", ASCENDING), ("external_domain", ASCENDING)], unique=True
         )
         self.events.create_index([("timestamp", ASCENDING)])
         self.external.create_index(
@@ -312,7 +312,7 @@ class MongoRepository:
                     "domain": domain,
                     "priority": priority,
                     "priority_rank": Config.PRIORITY_ORDER[priority],
-                    "status": "RUNNING",
+                    "status": "READY",
                     "successful_pages": 0,
                     "discovered_count": 0,
                     "failed_count": 0,
@@ -418,7 +418,7 @@ class MongoRepository:
             {"$set": {
                 "status": "RESERVED",
                 "worker_id": worker_id,
-                "lease_until": now,
+                "lease_until": now + __import__("datetime").timedelta(seconds=60),
                 "updated_at": now
             }},
             return_document=ReturnDocument.AFTER
@@ -445,19 +445,23 @@ class MongoRepository:
         )
 
     def save_external(self, session_id, source_domain, url, status_code=None):
-        self.external.update_one(
-            {"session_id": session_id, "url": url},
+        external_domain = URLManager.registrable_domain(url)
+        result = self.external.update_one(
+            {"session_id": session_id, "external_domain": external_domain},
             {"$setOnInsert": {
                 "session_id": session_id,
                 "source_domain": source_domain,
+                "external_domain": external_domain,
                 "url": url,
                 "status_code": status_code,
                 "first_seen_at": self.now()
             }},
             upsert=True
         )
-        self.log(session_id, "EXTERNAL_DOMAIN_RECORDED", url,
-                 source_domain, "SKIPPED")
+        if result.upserted_id:
+            self.log(session_id, "EXTERNAL_DOMAIN_RECORDED", url,
+                     source_domain, "SKIPPED",
+                     {"external_domain": external_domain})
 
     def get_session(self, session_id):
         return self.sessions.find_one({"session_id": session_id})
@@ -682,7 +686,14 @@ class DomainCrawler:
                         "status": "READY"
                     })
                     if pending_retries:
-                        await asyncio.sleep(1)
+                        # No other eligible URL remains; release the retry delay
+                        # rather than waiting forever at the end of the queue.
+                        self.repository.urls.update_many(
+                            {"session_id": session_id, "domain": domain,
+                             "status": "READY",
+                             "retry_after_successes": {"$gt": success_count}},
+                            {"$set": {"retry_after_successes": success_count}}
+                        )
                         continue
                     break
 
@@ -854,26 +865,26 @@ class Ingestor:
         while not self.control["stop"] and not self.control["pause"]:
             self.repository.recover_expired_jobs()
 
-            outstanding = self.repository.count_status(
-                session_id, ["READY", "RESERVED"]
-            )
+            outstanding = self.repository.domains.count_documents({
+                "session_id": session_id,
+                "status": {"$in": ["READY", "RESERVED"]}
+            })
             capacity = max(
                 0, Config.COMPUTE_SUBMIT_CAPACITY - outstanding
             )
 
             while capacity > 0 and not self.available.empty():
-                domain_doc = self.repository.domains.find_one({
-                    "session_id": session_id,
-                    "status": {"$in": ["RUNNING", "READY"]}
-                }, sort=[("priority_rank", ASCENDING), ("created_at", ASCENDING)])
+                domain_doc = self.repository.domains.find_one_and_update(
+                    {"session_id": session_id, "status": "READY"},
+                    {"$set": {"status": "RESERVED"}},
+                    sort=[("priority_rank", ASCENDING), ("created_at", ASCENDING)],
+                    return_document=ReturnDocument.AFTER
+                )
 
                 if not domain_doc:
                     break
 
                 domain = domain_doc["domain"]
-                if domain in self.active_domains:
-                    break
-
                 worker = await self.available.get()
                 self.active_domains.add(domain)
                 task = asyncio.create_task(
@@ -890,6 +901,9 @@ class Ingestor:
                 })
                 if unfinished == 0:
                     break
+                if self.available.empty():
+                    await asyncio.sleep(1)
+                    continue
 
             await asyncio.sleep(Config.INGESTOR_INTERVAL_SECONDS)
 
